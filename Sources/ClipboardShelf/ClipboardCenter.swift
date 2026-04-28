@@ -38,15 +38,21 @@ final class ClipboardCenter: NSObject, ObservableObject {
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
     private let popover = NSPopover()
+    private var settingsWindowController: NSWindowController?
     private var hotKeyManager: HotKeyManager?
     private var monitorTimer: Timer?
     private var lastChangeCount: Int
     private var isInternalCopy = false
     private var previousActiveApplication: NSRunningApplication?
+    private var previousFocusedElement: AXUIElement?
+    private var previousFocusedElementPID: pid_t?
     private var lastExternalApplication: NSRunningApplication?
     private var workspaceActivationObserver: Any?
     private var lastDesktopScreenshotScanDate: Date
     private var importedScreenshotSignatures = Set<String>()
+    private var keyboardFocusRestoreWorkItem: DispatchWorkItem?
+    private var lastViewedTextID: UUID?
+    private var lastViewedImageID: UUID?
 
     private override init() {
         self.lastChangeCount = pasteboard.changeCount
@@ -145,11 +151,13 @@ final class ClipboardCenter: NSObject, ObservableObject {
 
     func selectText(_ item: ClipboardItem) {
         selectedTextID = item.id
+        lastViewedTextID = item.id
         selectedTab = .text
     }
 
     func selectImage(_ item: ClipboardImageItem) {
         selectedImageID = item.id
+        lastViewedImageID = item.id
         selectedTab = .screenshots
     }
 
@@ -164,6 +172,7 @@ final class ClipboardCenter: NSObject, ObservableObject {
             let currentIndex = textItems.firstIndex { $0.id == selectedTextID } ?? 0
             let nextIndex = max(0, min(textItems.count - 1, currentIndex + delta))
             selectedTextID = textItems[nextIndex].id
+            lastViewedTextID = selectedTextID
         case .screenshots:
             guard !imageItems.isEmpty else {
                 selectedImageID = nil
@@ -173,6 +182,7 @@ final class ClipboardCenter: NSObject, ObservableObject {
             let currentIndex = imageItems.firstIndex { $0.id == selectedImageID } ?? 0
             let nextIndex = max(0, min(imageItems.count - 1, currentIndex + delta))
             selectedImageID = imageItems[nextIndex].id
+            lastViewedImageID = selectedImageID
         }
     }
 
@@ -183,8 +193,41 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         let nextIndex = max(0, min(tabs.count - 1, currentIndex + delta))
-        selectedTab = tabs[nextIndex]
+        setSelectedTab(tabs[nextIndex])
+    }
+
+    func setSelectedTab(_ tab: ClipboardTab) {
+        switch tab {
+        case .text:
+            if let lastViewedTextID,
+               textItems.contains(where: { $0.id == lastViewedTextID }) {
+                selectedTextID = lastViewedTextID
+            }
+        case .screenshots:
+            if let lastViewedImageID,
+               imageItems.contains(where: { $0.id == lastViewedImageID }) {
+                selectedImageID = lastViewedImageID
+            }
+        }
+
+        selectedTab = tab
         ensureSelection()
+        restoreKeyboardFocusIfNeeded(after: 0.12)
+    }
+
+    func restoreKeyboardFocusIfNeeded(after delay: TimeInterval = 0) {
+        keyboardFocusRestoreWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.restorePopoverKeyboardFocus()
+        }
+        keyboardFocusRestoreWorkItem = workItem
+
+        if delay <= 0 {
+            DispatchQueue.main.async(execute: workItem)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
     }
 
     func pasteSelectedImmediately() {
@@ -215,6 +258,20 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         return NSImage(contentsOf: url)
+    }
+
+    func screenshotDisplayName(for item: ClipboardImageItem) -> String {
+        if let currentSourceName = currentScreenshotSourceName(for: item) {
+            return currentSourceName
+        }
+
+        if let originalSourceName = originalScreenshotSourceName(for: item) {
+            return originalSourceName
+        }
+
+        return URL(fileURLWithPath: item.fileName)
+            .deletingPathExtension()
+            .lastPathComponent
     }
 
     func isSelected(textItem: ClipboardItem) -> Bool {
@@ -264,8 +321,11 @@ final class ClipboardCenter: NSObject, ObservableObject {
     }
 
     func openSettings() {
+        let controller = settingsWindowController ?? makeSettingsWindowController()
+        settingsWindowController = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
     }
 
     func quitApplication() {
@@ -305,10 +365,45 @@ final class ClipboardCenter: NSObject, ObservableObject {
 
     private func showPopover(relativeTo button: NSStatusBarButton) {
         previousActiveApplication = currentTargetApplication()
+        previousFocusedElement = captureFocusedElement(for: previousActiveApplication)
+        previousFocusedElementPID = previousActiveApplication?.processIdentifier
         ensureSelection()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
         NSApp.activate(ignoringOtherApps: true)
+        restorePopoverKeyboardFocus()
+    }
+
+    private func restorePopoverKeyboardFocus() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let window = self.popover.contentViewController?.view.window else {
+                return
+            }
+
+            window.makeKey()
+            if let keyboardView = self.findKeyboardHandlingView(in: window.contentView) {
+                window.makeFirstResponder(keyboardView)
+            }
+        }
+    }
+
+    private func findKeyboardHandlingView(in view: NSView?) -> KeyboardHandlingView? {
+        guard let view else {
+            return nil
+        }
+
+        if let keyboardView = view as? KeyboardHandlingView {
+            return keyboardView
+        }
+
+        for subview in view.subviews {
+            if let match = findKeyboardHandlingView(in: subview) {
+                return match
+            }
+        }
+
+        return nil
     }
 
     private func showStatusMenu() {
@@ -571,16 +666,20 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         lastPasteTargetName = targetApplication.localizedName ?? targetApplication.bundleIdentifier ?? "Неизвестно"
+        closePopover()
 
         if case let .text(text) = payload,
-           insertTextViaAccessibility(text, pid: targetApplication.processIdentifier) {
+           insertTextViaAccessibility(
+               text,
+               pid: targetApplication.processIdentifier,
+               preferredElement: preferredFocusedElement(for: targetApplication)
+           ) {
             lastPasteStatus = "Текст вставлен через Accessibility"
-            closePopover()
+            restoreTextInputFocus(in: targetApplication)
             return
         }
 
         lastPasteStatus = "Возвращаю фокус в \(lastPasteTargetName)"
-        closePopover()
         targetApplication.activate(options: [.activateIgnoringOtherApps])
         NSApp.hide(nil)
 
@@ -674,12 +773,18 @@ final class ClipboardCenter: NSObject, ObservableObject {
 
     private func ensureSelection() {
         if selectedTextID == nil || !textItems.contains(where: { $0.id == selectedTextID }) {
-            selectedTextID = textItems.first?.id
+            selectedTextID = lastViewedTextID.flatMap { rememberedID in
+                textItems.first(where: { $0.id == rememberedID })?.id
+            } ?? textItems.first?.id
         }
+        lastViewedTextID = selectedTextID
 
         if selectedImageID == nil || !imageItems.contains(where: { $0.id == selectedImageID }) {
-            selectedImageID = imageItems.first?.id
+            selectedImageID = lastViewedImageID.flatMap { rememberedID in
+                imageItems.first(where: { $0.id == rememberedID })?.id
+            } ?? imageItems.first?.id
         }
+        lastViewedImageID = selectedImageID
 
         switch selectedTab {
         case .text where textItems.isEmpty && !imageItems.isEmpty:
@@ -752,6 +857,59 @@ final class ClipboardCenter: NSObject, ObservableObject {
         return "\(fileURL.lastPathComponent.lowercased())::\(date)"
     }
 
+    private func currentScreenshotSourceName(for item: ClipboardImageItem) -> String? {
+        guard let sourceSignature = item.sourceSignature,
+              let signatureDate = screenshotDateFromSignature(sourceSignature),
+              let desktopURL = fileManager.urls(for: .desktopDirectory, in: .userDomainMask).first,
+              let fileURLs = try? fileManager.contentsOfDirectory(
+                  at: desktopURL,
+                  includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey, .isRegularFileKey],
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return nil
+        }
+
+        let matchedURL = fileURLs
+            .filter { isImageFile($0) }
+            .min { lhs, rhs in
+                abs(screenshotDate(for: lhs).timeIntervalSince(signatureDate)) <
+                abs(screenshotDate(for: rhs).timeIntervalSince(signatureDate))
+            }
+
+        guard let matchedURL,
+              abs(screenshotDate(for: matchedURL).timeIntervalSince(signatureDate)) < 2 else {
+            return nil
+        }
+
+        return matchedURL.deletingPathExtension().lastPathComponent
+    }
+
+    private func originalScreenshotSourceName(for item: ClipboardImageItem) -> String? {
+        guard let sourceSignature = item.sourceSignature,
+              let separatorRange = sourceSignature.range(of: "::", options: .backwards) else {
+            return nil
+        }
+
+        let fileName = String(sourceSignature[..<separatorRange.lowerBound])
+        return URL(fileURLWithPath: fileName)
+            .deletingPathExtension()
+            .lastPathComponent
+    }
+
+    private func isImageFile(_ fileURL: URL) -> Bool {
+        let fileExtension = fileURL.pathExtension.lowercased()
+        return ["png", "jpg", "jpeg"].contains(fileExtension)
+    }
+
+    private func screenshotDateFromSignature(_ sourceSignature: String) -> Date? {
+        guard let separatorRange = sourceSignature.range(of: "::", options: .backwards) else {
+            return nil
+        }
+
+        let dateString = String(sourceSignature[separatorRange.upperBound...])
+        return ISO8601DateFormatter().date(from: dateString)
+    }
+
     private func updateLastExternalApplication(from application: NSRunningApplication?) {
         guard let application,
               application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
@@ -760,6 +918,8 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         lastExternalApplication = application
+        previousFocusedElement = captureFocusedElement(for: application)
+        previousFocusedElementPID = application.processIdentifier
     }
 
     private func currentTargetApplication() -> NSRunningApplication? {
@@ -824,24 +984,19 @@ final class ClipboardCenter: NSObject, ObservableObject {
     private func performPaste(payload: PastePayload, targetApplication: NSRunningApplication) {
         switch payload {
         case .text(let text):
-            if insertTextViaAccessibility(text, pid: targetApplication.processIdentifier) {
+            if insertTextViaAccessibility(
+                text,
+                pid: targetApplication.processIdentifier,
+                preferredElement: preferredFocusedElement(for: targetApplication)
+            ) {
                 lastPasteStatus = "Текст вставлен через Accessibility"
-                return
-            }
-
-            if triggerPasteMenuAction(pid: targetApplication.processIdentifier) {
-                lastPasteStatus = "Вставка выполнена через меню приложения"
+                restoreTextInputFocus(in: targetApplication)
                 return
             }
 
             lastPasteStatus = "AX-вставка не сработала, отправляю Cmd+V"
             sendPasteShortcut()
         case .pasteboard:
-            if triggerPasteMenuAction(pid: targetApplication.processIdentifier) {
-                lastPasteStatus = "Вставка выполнена через меню приложения"
-                return
-            }
-
             lastPasteStatus = "Отправляю Cmd+V"
             sendPasteShortcut()
         }
@@ -868,24 +1023,65 @@ final class ClipboardCenter: NSObject, ObservableObject {
         lastPasteStatus = "Команда Cmd+V отправлена"
     }
 
-    private func insertTextViaAccessibility(_ text: String, pid: pid_t) -> Bool {
-        let applicationElement = AXUIElementCreateApplication(pid)
-        var focusedElement: CFTypeRef?
+    private func restoreTextInputFocus(in application: NSRunningApplication) {
+        let preferredElement = preferredFocusedElement(for: application)
 
-        let focusedResult = AXUIElementCopyAttributeValue(
-            applicationElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElement
-        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            application.activate(options: [.activateIgnoringOtherApps])
 
-        guard focusedResult == .success,
-              let focusedElement else {
-            return false
+            guard let preferredElement else {
+                return
+            }
+
+            _ = AXUIElementSetAttributeValue(
+                preferredElement,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+        }
+    }
+
+    private func insertTextViaAccessibility(_ text: String, pid: pid_t, preferredElement: AXUIElement?) -> Bool {
+        let uiElement: AXUIElement
+
+        if let preferredElement {
+            uiElement = resolveEditableElement(from: preferredElement) ?? preferredElement
+        } else {
+            let applicationElement = AXUIElementCreateApplication(pid)
+            var focusedElement: CFTypeRef?
+
+            let focusedResult = AXUIElementCopyAttributeValue(
+                applicationElement,
+                kAXFocusedUIElementAttribute as CFString,
+                &focusedElement
+            )
+
+            guard focusedResult == .success,
+                  let focusedElement else {
+                return false
+            }
+
+            let focusedUIElement = focusedElement as! AXUIElement
+            uiElement = resolveEditableElement(from: focusedUIElement) ?? focusedUIElement
         }
 
-        let uiElement = focusedElement as! AXUIElement
         let originalValue = accessibilityStringValue(for: uiElement)
         let cfText = text as CFString
+
+        if let currentString = originalValue,
+           let selectedRange = accessibilitySelectedRange(for: uiElement),
+           let updatedValue = stringByReplacing(range: selectedRange, in: currentString, with: text),
+           AXUIElementSetAttributeValue(uiElement, kAXValueAttribute as CFString, updatedValue as CFString) == .success {
+            let insertedLocation = selectedRange.location + (text as NSString).length
+            _ = setAccessibilitySelectedRange(
+                NSRange(location: insertedLocation, length: 0),
+                for: uiElement
+            )
+
+            if accessibilityStringValue(for: uiElement) == updatedValue {
+                return true
+            }
+        }
 
         let selectedTextResult = AXUIElementSetAttributeValue(
             uiElement,
@@ -926,6 +1122,35 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         return accessibilityStringValue(for: uiElement) == newValue
+    }
+
+    private func preferredFocusedElement(for application: NSRunningApplication) -> AXUIElement? {
+        guard previousFocusedElementPID == application.processIdentifier else {
+            return captureFocusedElement(for: application)
+        }
+
+        return previousFocusedElement ?? captureFocusedElement(for: application)
+    }
+
+    private func captureFocusedElement(for application: NSRunningApplication?) -> AXUIElement? {
+        guard let application else {
+            return nil
+        }
+
+        let applicationElement = AXUIElementCreateApplication(application.processIdentifier)
+        var focusedElement: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElement
+        )
+
+        guard result == .success,
+              let focusedElement else {
+            return nil
+        }
+
+        return focusedElement as! AXUIElement
     }
 
     private func hasFocusedElement(for pid: pid_t) -> Bool {
@@ -974,6 +1199,59 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         return value as? String
+    }
+
+    private func accessibilitySelectedRange(for element: AXUIElement) -> NSRange? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &value
+        )
+
+        guard result == .success,
+              let value,
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let axValue = value as! AXValue
+        guard AXValueGetType(axValue) == .cfRange else {
+            return nil
+        }
+
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range) else {
+            return nil
+        }
+
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    @discardableResult
+    private func setAccessibilitySelectedRange(_ range: NSRange, for element: AXUIElement) -> Bool {
+        var cfRange = CFRange(location: range.location, length: range.length)
+        guard let axValue = AXValueCreate(.cfRange, &cfRange) else {
+            return false
+        }
+
+        let result = AXUIElementSetAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            axValue
+        )
+
+        return result == .success
+    }
+
+    private func stringByReplacing(range: NSRange, in source: String, with replacement: String) -> String? {
+        guard let swiftRange = Range(range, in: source) else {
+            return nil
+        }
+
+        var updated = source
+        updated.replaceSubrange(swiftRange, with: replacement)
+        return updated
     }
 
     private func triggerPasteMenuAction(pid: pid_t) -> Bool {
@@ -1047,6 +1325,92 @@ final class ClipboardCenter: NSObject, ObservableObject {
         return value as? [AXUIElement]
     }
 
+    private func accessibilityParent(of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXParentAttribute as CFString,
+            &value
+        )
+
+        guard result == .success,
+              let value else {
+            return nil
+        }
+
+        return value as! AXUIElement
+    }
+
+    private func accessibilityRole(of element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXRoleAttribute as CFString,
+            &value
+        )
+
+        guard result == .success else {
+            return nil
+        }
+
+        return value as? String
+    }
+
+    private func resolveEditableElement(from element: AXUIElement) -> AXUIElement? {
+        if isEditableTextElement(element) {
+            return element
+        }
+
+        var currentParent = accessibilityParent(of: element)
+        for _ in 0..<5 {
+            guard let parent = currentParent else {
+                break
+            }
+
+            if isEditableTextElement(parent) {
+                return parent
+            }
+
+            currentParent = accessibilityParent(of: parent)
+        }
+
+        return firstEditableDescendant(of: element, depthRemaining: 4)
+    }
+
+    private func firstEditableDescendant(of element: AXUIElement, depthRemaining: Int) -> AXUIElement? {
+        guard depthRemaining > 0,
+              let children = accessibilityChildren(of: element) else {
+            return nil
+        }
+
+        for child in children {
+            if isEditableTextElement(child) {
+                return child
+            }
+
+            if let nested = firstEditableDescendant(of: child, depthRemaining: depthRemaining - 1) {
+                return nested
+            }
+        }
+
+        return nil
+    }
+
+    private func isEditableTextElement(_ element: AXUIElement) -> Bool {
+        let role = accessibilityRole(of: element)
+        let textRoles = [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String]
+
+        if let role, textRoles.contains(role) {
+            return true
+        }
+
+        if accessibilitySelectedRange(for: element) != nil {
+            return true
+        }
+
+        return accessibilityStringValue(for: element) != nil
+    }
+
     private func accessibilityTitle(of element: AXUIElement) -> String? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(
@@ -1068,6 +1432,19 @@ final class ClipboardCenter: NSObject, ObservableObject {
         }
 
         return children.first
+    }
+
+    private func makeSettingsWindowController() -> NSWindowController {
+        let controller = NSHostingController(
+            rootView: SettingsView(center: self)
+                .frame(width: 500, height: 340)
+        )
+        let window = NSWindow(contentViewController: controller)
+        window.title = "Настройки ClipboardShelf"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.center()
+        window.isReleasedWhenClosed = false
+        return NSWindowController(window: window)
     }
 }
 

@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ClipboardMenuView: View {
     @ObservedObject var center: ClipboardCenter
+    private let calendar = Calendar.current
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -50,12 +51,23 @@ struct ClipboardMenuView: View {
     }
 
     private var tabPicker: some View {
-        Picker("Вкладка", selection: $center.selectedTab) {
+        Picker("Вкладка", selection: tabSelectionBinding) {
             ForEach(ClipboardTab.allCases) { tab in
                 Text(tab.title).tag(tab)
             }
         }
         .pickerStyle(.segmented)
+    }
+
+    private var tabSelectionBinding: Binding<ClipboardTab> {
+        Binding(
+            get: { center.selectedTab },
+            set: { newValue in
+                DispatchQueue.main.async {
+                    center.setSelectedTab(newValue)
+                }
+            }
+        )
     }
 
     private var textList: some View {
@@ -69,17 +81,24 @@ struct ClipboardMenuView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(center.textItems) { item in
-                                TextClipboardRow(
-                                    item: item,
-                                    isSelected: center.isSelected(textItem: item),
-                                    onSelect: { center.selectText(item) },
-                                    onInstantPaste: { center.pasteTextImmediately(item) },
-                                    onCopy: { center.copyText(item) },
-                                    onDelete: { center.removeText(item) }
-                                )
-                                .id(item.id)
+                        LazyVStack(spacing: 14) {
+                            ForEach(textRows) { row in
+                                switch row {
+                                case .header(let id, let title):
+                                    sectionHeader(title: title)
+                                        .id(id)
+                                case .item(let item, let tint):
+                                    TextClipboardRow(
+                                        item: item,
+                                        tint: tint,
+                                        isSelected: center.isSelected(textItem: item),
+                                        onSelect: { center.selectText(item) },
+                                        onInstantPaste: { center.pasteTextImmediately(item) },
+                                        onCopy: { center.copyText(item) },
+                                        onDelete: { center.removeText(item) }
+                                    )
+                                    .id(item.id)
+                                }
                             }
                         }
                         .padding(.vertical, 2)
@@ -88,6 +107,10 @@ struct ClipboardMenuView: View {
                         scrollToSelectedText(with: proxy)
                     }
                     .onChange(of: center.selectedTextID) { _ in
+                        scrollToSelectedText(with: proxy)
+                    }
+                    .onChange(of: center.selectedTab) { tab in
+                        guard tab == .text else { return }
                         scrollToSelectedText(with: proxy)
                     }
                 }
@@ -106,18 +129,26 @@ struct ClipboardMenuView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(center.imageItems) { item in
-                                ScreenshotClipboardRow(
-                                    item: item,
-                                    image: center.image(for: item),
-                                    isSelected: center.isSelected(imageItem: item),
-                                    onSelect: { center.selectImage(item) },
-                                    onInstantPaste: { center.pasteImageImmediately(item) },
-                                    onCopy: { center.copyImage(item) },
-                                    onDelete: { center.removeImage(item) }
-                                )
-                                .id(item.id)
+                        LazyVStack(spacing: 14) {
+                            ForEach(imageRows) { row in
+                                switch row {
+                                case .header(let id, let title):
+                                    sectionHeader(title: title)
+                                        .id(id)
+                                case .item(let item, let tint):
+                                    ScreenshotClipboardRow(
+                                        item: item,
+                                        image: center.image(for: item),
+                                        displayName: center.screenshotDisplayName(for: item),
+                                        tint: tint,
+                                        isSelected: center.isSelected(imageItem: item),
+                                        onSelect: { center.selectImage(item) },
+                                        onInstantPaste: { center.pasteImageImmediately(item) },
+                                        onCopy: { center.copyImage(item) },
+                                        onDelete: { center.removeImage(item) }
+                                    )
+                                    .id(item.id)
+                                }
                             }
                         }
                         .padding(.vertical, 2)
@@ -126,6 +157,10 @@ struct ClipboardMenuView: View {
                         scrollToSelectedImage(with: proxy)
                     }
                     .onChange(of: center.selectedImageID) { _ in
+                        scrollToSelectedImage(with: proxy)
+                    }
+                    .onChange(of: center.selectedTab) { tab in
+                        guard tab == .screenshots else { return }
                         scrollToSelectedImage(with: proxy)
                     }
                 }
@@ -139,6 +174,34 @@ struct ClipboardMenuView: View {
             center.textItems.isEmpty
         case .screenshots:
             center.imageItems.isEmpty
+        }
+    }
+
+    private var groupedTextItems: [HistorySection<ClipboardItem>] {
+        makeSections(from: center.textItems)
+    }
+
+    private var groupedImageItems: [HistorySection<ClipboardImageItem>] {
+        makeSections(from: center.imageItems)
+    }
+
+    private var textRows: [TextListRow] {
+        groupedTextItems.flatMap { section in
+            var rows: [TextListRow] = [
+                .header(id: UUID(), title: title(for: section.day))
+            ]
+            rows.append(contentsOf: section.items.map { .item($0, tint: section.tint) })
+            return rows
+        }
+    }
+
+    private var imageRows: [ImageListRow] {
+        groupedImageItems.flatMap { section in
+            var rows: [ImageListRow] = [
+                .header(id: UUID(), title: title(for: section.day))
+            ]
+            rows.append(contentsOf: section.items.map { .item($0, tint: section.tint) })
+            return rows
         }
     }
 
@@ -159,13 +222,29 @@ struct ClipboardMenuView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private func sectionHeader(title: String) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 2)
+    }
+
     private func scrollToSelectedText(with proxy: ScrollViewProxy) {
         guard let id = center.selectedTextID else {
             return
         }
 
-        withAnimation {
-            proxy.scrollTo(id, anchor: .center)
+        DispatchQueue.main.async {
+            withAnimation {
+                proxy.scrollTo(id, anchor: .center)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation {
+                proxy.scrollTo(id, anchor: .center)
+            }
         }
     }
 
@@ -174,14 +253,83 @@ struct ClipboardMenuView: View {
             return
         }
 
-        withAnimation {
-            proxy.scrollTo(id, anchor: .center)
+        DispatchQueue.main.async {
+            withAnimation {
+                proxy.scrollTo(id, anchor: .center)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            withAnimation {
+                proxy.scrollTo(id, anchor: .center)
+            }
         }
     }
+
+    private func makeSections<Item: Identifiable>(from items: [Item]) -> [HistorySection<Item>] where Item: DatedClipboardItem {
+        let grouped = Dictionary(grouping: items) { item in
+            calendar.startOfDay(for: item.createdAt)
+        }
+
+        let sortedDays = grouped.keys.sorted(by: >)
+        let tints: [Color] = [
+            Color.accentColor.opacity(0.09),
+            Color.cyan.opacity(0.12),
+            Color.yellow.opacity(0.12),
+            Color.indigo.opacity(0.09),
+            Color.mint.opacity(0.09),
+            Color.pink.opacity(0.09),
+            Color.green.opacity(0.09),
+            Color.purple.opacity(0.09),
+            
+            
+            
+        ]
+
+        return sortedDays.enumerated().compactMap { index, day in
+            guard let sectionItems = grouped[day] else {
+                return nil
+            }
+
+            return HistorySection(
+                day: day,
+                tint: tints[index % tints.count],
+                items: sectionItems.sorted { $0.createdAt > $1.createdAt }
+            )
+        }
+    }
+
+    private func title(for day: Date) -> String {
+        if calendar.isDateInToday(day) {
+            return "Сегодня"
+        }
+
+        if calendar.isDateInYesterday(day) {
+            return "Вчера"
+        }
+
+        return day.formatted(date: .abbreviated, time: .omitted)
+    }
+}
+
+private protocol DatedClipboardItem {
+    var createdAt: Date { get }
+}
+
+extension ClipboardItem: DatedClipboardItem {}
+extension ClipboardImageItem: DatedClipboardItem {}
+
+private struct HistorySection<Item: Identifiable>: Identifiable {
+    let day: Date
+    let tint: Color
+    let items: [Item]
+
+    var id: Date { day }
 }
 
 private struct TextClipboardRow: View {
     let item: ClipboardItem
+    let tint: Color
     let isSelected: Bool
     let onSelect: () -> Void
     let onInstantPaste: () -> Void
@@ -227,7 +375,7 @@ private struct TextClipboardRow: View {
             }
         }
         .padding(12)
-        .background(isSelected ? Color.accentColor.opacity(0.16) : Color(nsColor: .windowBackgroundColor))
+        .background(isSelected ? Color.accentColor.opacity(0.16) : tint)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
                 .stroke(isSelected ? Color.accentColor.opacity(0.45) : Color.black.opacity(0.08), lineWidth: 1)
@@ -243,6 +391,8 @@ private struct TextClipboardRow: View {
 private struct ScreenshotClipboardRow: View {
     let item: ClipboardImageItem
     let image: NSImage?
+    let displayName: String
+    let tint: Color
     let isSelected: Bool
     let onSelect: () -> Void
     let onInstantPaste: () -> Void
@@ -269,8 +419,9 @@ private struct ScreenshotClipboardRow: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Снимок экрана")
+                Text(displayName)
                     .font(.headline)
+                    .lineLimit(2)
 
                 Text("\(Int(item.pixelWidth)) x \(Int(item.pixelHeight))")
                     .font(.caption)
@@ -304,7 +455,7 @@ private struct ScreenshotClipboardRow: View {
             Spacer()
         }
         .padding(12)
-        .background(isSelected ? Color.accentColor.opacity(0.16) : Color(nsColor: .windowBackgroundColor))
+        .background(isSelected ? Color.accentColor.opacity(0.16) : tint)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
                 .stroke(isSelected ? Color.accentColor.opacity(0.45) : Color.black.opacity(0.08), lineWidth: 1)
@@ -313,6 +464,34 @@ private struct ScreenshotClipboardRow: View {
         .contentShape(RoundedRectangle(cornerRadius: 12))
         .onTapGesture {
             onSelect()
+        }
+    }
+}
+
+private enum TextListRow: Identifiable {
+    case header(id: UUID, title: String)
+    case item(ClipboardItem, tint: Color)
+
+    var id: UUID {
+        switch self {
+        case .header(let id, _):
+            return id
+        case .item(let item, _):
+            return item.id
+        }
+    }
+}
+
+private enum ImageListRow: Identifiable {
+    case header(id: UUID, title: String)
+    case item(ClipboardImageItem, tint: Color)
+
+    var id: UUID {
+        switch self {
+        case .header(let id, _):
+            return id
+        case .item(let item, _):
+            return item.id
         }
     }
 }
